@@ -1,0 +1,640 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+			[
+				"Fuse",
+				"FuseUnmount"
+			],
+			[
+				"Vol",
+				"VolumeFile"
+			],
+			[
+				"Fus",
+				"FuseMountPoint"
+			],
+			[
+				"FUse",
+				"Fuse"
+			],
+			[
+				"inc",
+				"include"
+			]
+		]
+	},
+	"buffers":
+	[
+		{
+			"file": "Platform/FileStego.cpp",
+			"settings":
+			{
+				"buffer_size": 5157,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"contents": "/*\n Copyright (c) 2008-2010 TrueCrypt Developers Association. All rights reserved.\n\n Governed by the TrueCrypt License 3.0 the full text of which is contained in\n the file License.txt included in TrueCrypt binary and source code distribution\n packages.\n*/\n\n#include \"CoreUnix.h\"\n#include <errno.h>\n#include <iostream>\n#include <signal.h>\n#include <sys/stat.h>\n#include <sys/types.h>\n#include <stdio.h>\n#include <unistd.h>\n#include \"Platform/FileStream.h\"\n#include \"Driver/Fuse/FuseService.h\"\n#include \"Volume/VolumePasswordCache.h\"\n\nnamespace TrueCrypt\n{\n	CoreUnix::CoreUnix ()\n	{\n		signal (SIGPIPE, SIG_IGN);\n		\n		char *loc = setlocale (LC_ALL, \"\");\n		if (!loc || string (loc) == \"C\")\n			setlocale (LC_ALL, \"en_US.UTF-8\");\n	}\n\n	CoreUnix::~CoreUnix ()\n	{\n	}\n	\n	void CoreUnix::CheckFilesystem (shared_ptr <VolumeInfo> mountedVolume, bool repair) const\n	{\n		if (!mountedVolume->MountPoint.IsEmpty())\n			DismountFilesystem (mountedVolume->MountPoint, false);\n\n		list <string> args;\n\n		args.push_back (\"-T\");\n		args.push_back (\"fsck\");\n\n		args.push_back (\"-e\");\n\n		string xargs = \"fsck \";\n\n#ifdef TC_LINUX\n		if (!repair)\n			xargs += \"-n \";\n		else\n			xargs += \"-r \";\n#endif\n\n		xargs += string (mountedVolume->VirtualDevice) + \"; echo '[Done]'; read W\";\n		args.push_back (xargs);\n\n		try\n		{\n			Process::Execute (\"xterm\", args, 1000);\n		} catch (TimeOut&) { }\n	}\n\n	void CoreUnix::DismountFilesystem (const DirectoryPath &mountPoint, bool force) const\n	{\n		list <string> args;\n\n#ifdef TC_MACOSX\n		if (force)\n			args.push_back (\"-f\");\n#endif\n		args.push_back (\"--\");\n		args.push_back (mountPoint);\n\n		Process::Execute (\"umount\", args);\n	}\n\n	shared_ptr <VolumeInfo> CoreUnix::DismountVolume (shared_ptr <VolumeInfo> mountedVolume, bool ignoreOpenFiles, bool syncVolumeInfo)\n	{\n		if (!mountedVolume->MountPoint.IsEmpty())\n		{\n			DismountFilesystem (mountedVolume->MountPoint, ignoreOpenFiles);\n\n			// Delete mount directory if a default path has been used\n			if (string (mountedVolume->MountPoint).find (GetDefaultMountPointPrefix()) == 0)\n				mountedVolume->MountPoint.Delete();\n		}\n\n		try\n		{\n			DismountNativeVolume (mountedVolume);\n		}\n		catch (NotApplicable &) { }\n\n		if (!mountedVolume->LoopDevice.IsEmpty())\n		{\n			try\n			{\n				DetachLoopDevice (mountedVolume->LoopDevice);\n			}\n			catch (ExecutedProcessFailed&) { }\n		}\n\n		if (syncVolumeInfo || mountedVolume->Protection == VolumeProtection::HiddenVolumeReadOnly)\n		{\n			sync();\n			VolumeInfoList ml = GetMountedVolumes (mountedVolume->Path);\n\n			if (ml.size() > 0)\n				mountedVolume = ml.front();\n		}\n\n		list <string> args;\n		args.push_back (\"--\");\n		args.push_back (mountedVolume->AuxMountPoint);\n\n		for (int t = 0; true; t++)\n		{\n			try\n			{\n				Process::Execute (\"umount\", args);\n				break;\n			}\n			catch (ExecutedProcessFailed&)\n			{\n				if (t > 10)\n					throw;\n				Thread::Sleep (200);\n			}\n		}\n\n		try\n		{\n			mountedVolume->AuxMountPoint.Delete();\n		}\n		catch (...)	{ }\n\n		VolumeEventArgs eventArgs (mountedVolume);\n		VolumeDismountedEvent.Raise (eventArgs);\n\n		return mountedVolume;\n	}\n\n	bool CoreUnix::FilesystemSupportsLargeFiles (const FilePath &filePath) const\n	{\n		string path = filePath;\n		size_t pos;\n		\n		while ((pos = path.find_last_of ('/')) != string::npos)\n		{\n			path = path.substr (0, pos);\n\n			if (path.empty())\n				break;\n\n			try\n			{\n				MountedFilesystemList filesystems = GetMountedFilesystems (DevicePath(), path);\n				if (!filesystems.empty())\n				{\n					const MountedFilesystem &fs = *filesystems.front();\n\n					if (fs.Type == \"fat\"\n						|| fs.Type == \"fat32\"\n						|| fs.Type == \"vfat\"\n						|| fs.Type == \"fatfs\"\n						|| fs.Type == \"msdos\"\n						|| fs.Type == \"msdosfs\"\n						|| fs.Type == \"umsdos\"\n						|| fs.Type == \"dos\"\n						|| fs.Type == \"dosfs\"\n						|| fs.Type == \"pcfs\"\n						)\n					{\n						return false;\n					}\n\n					return true;\n				}\n			}\n			catch (...) { }\n		}\n\n		return true;	// Prevent errors if the filesystem cannot be identified\n	}\n\n	bool CoreUnix::FilesystemSupportsUnixPermissions (const DevicePath &devicePath) const\n	{\n		File device;\n		device.Open (devicePath);\n\n		Buffer bootSector (device.GetDeviceSectorSize());\n		device.SeekAt (0);\n		device.ReadCompleteBuffer (bootSector);\n\n		byte *b = bootSector.Ptr(); \n\n		return memcmp (b + 3,  \"NTFS\", 4) != 0\n			&& memcmp (b + 54, \"FAT\", 3) != 0\n			&& memcmp (b + 82, \"FAT32\", 5) != 0\n			&& memcmp (b + 3,  \"EXFAT\", 5) != 0;\n	}\n\n	string CoreUnix::GetDefaultMountPointPrefix () const\n	{\n		const char *envPrefix = getenv (\"TRUECRYPT_MOUNT_PREFIX\");\n		if (envPrefix && !string (envPrefix).empty())\n			return envPrefix;\n		\n		if (FilesystemPath (\"/media\").IsDirectory())\n			return \"/media/truecrypt\";\n		\n		if (FilesystemPath (\"/mnt\").IsDirectory())\n			return \"/mnt/truecrypt\";\n		\n		return GetTempDirectory() + \"/truecrypt_mnt\";\n	}\n\n	uint32 CoreUnix::GetDeviceSectorSize (const DevicePath &devicePath) const\n	{\n		File dev;\n		dev.Open (devicePath);\n		return dev.GetDeviceSectorSize();\n	}\n\n	uint64 CoreUnix::GetDeviceSize (const DevicePath &devicePath) const\n	{\n		File dev;\n		dev.Open (devicePath);\n		return dev.Length();\n	}\n\n	DirectoryPath CoreUnix::GetDeviceMountPoint (const DevicePath &devicePath) const\n	{\n		DevicePath devPath = devicePath;\n#ifdef TC_MACOSX\n		if (string (devPath).find (\"/dev/rdisk\") != string::npos)\n			devPath = string (\"/dev/\") + string (devicePath).substr (6);\n#endif\n		MountedFilesystemList mountedFilesystems = GetMountedFilesystems (devPath);\n\n		if (mountedFilesystems.size() < 1)\n			return DirectoryPath();\n\n		return mountedFilesystems.front()->MountPoint;\n	}\n\n	VolumeInfoList CoreUnix::GetMountedVolumes (const VolumePath &volumePath) const\n	{\n		VolumeInfoList volumes;\n\n		foreach_ref (const MountedFilesystem &mf, GetMountedFilesystems ())\n		{\n			if (string (mf.MountPoint).find (GetFuseMountDirPrefix()) == string::npos)\n				continue;\n\n			shared_ptr <VolumeInfo> mountedVol;\n			try\n			{\n				shared_ptr <File> controlFile (new File);\n				controlFile->Open (string (mf.MountPoint) + FuseService::GetControlPath());\n\n				shared_ptr <Stream> controlFileStream (new FileStream (controlFile));\n				mountedVol = Serializable::DeserializeNew <VolumeInfo> (controlFileStream);\n			}\n			catch (...)\n			{\n				continue;\n			}\n			\n			if (!volumePath.IsEmpty() && wstring (mountedVol->Path).compare (volumePath) != 0)\n				continue;\n\n			mountedVol->AuxMountPoint = mf.MountPoint;\n\n			if (!mountedVol->VirtualDevice.IsEmpty())\n			{\n				MountedFilesystemList mpl = GetMountedFilesystems (mountedVol->VirtualDevice);\n\n				if (mpl.size() > 0)\n					mountedVol->MountPoint = mpl.front()->MountPoint;\n			}\n\n			volumes.push_back (mountedVol);\n\n			if (!volumePath.IsEmpty())\n				break;\n		}\n\n		return volumes;\n	}\n	\n	gid_t CoreUnix::GetRealGroupId () const\n	{\n		const char *env = getenv (\"SUDO_GID\");\n		if (env)\n		{\n			try\n			{\n				string s (env);\n				return static_cast <gid_t> (StringConverter::ToUInt64 (s));\n			}\n			catch (...) { }\n		}\n\n		return getgid();\n	}\n\n	uid_t CoreUnix::GetRealUserId () const\n	{\n		const char *env = getenv (\"SUDO_UID\");\n		if (env)\n		{\n			try\n			{\n				string s (env);\n				return static_cast <uid_t> (StringConverter::ToUInt64 (s));\n			}\n			catch (...) { }\n		}\n\n		return getuid();\n	}\n	\n	string CoreUnix::GetTempDirectory () const\n	{\n		char *envDir = getenv (\"TMPDIR\");\n		return envDir ? envDir : \"/tmp\";\n	}\n\n	bool CoreUnix::IsMountPointAvailable (const DirectoryPath &mountPoint) const\n	{\n		return GetMountedFilesystems (DevicePath(), mountPoint).size() == 0;\n	}\n\n	void CoreUnix::MountFilesystem (const DevicePath &devicePath, const DirectoryPath &mountPoint, const string &filesystemType, bool readOnly, const string &systemMountOptions) const\n	{\n		if (GetMountedFilesystems (DevicePath(), mountPoint).size() > 0)\n			throw MountPointUnavailable (SRC_POS);\n\n		list <string> args;\n		string options;\n\n		if (!filesystemType.empty())\n		{\n#ifdef TC_SOLARIS\n			args.push_back (\"-F\");\n#else\n			args.push_back (\"-t\");\n#endif\n			args.push_back (filesystemType);\n		}\n\n		if (readOnly)\n			options = \"-oro\";\n\n		if (!systemMountOptions.empty())\n		{\n			if (options.empty())\n				options = \"-o\";\n			else\n				options += \",\";\n\n			options += systemMountOptions;\n		}\n\n		if (!options.empty())\n			args.push_back (options);\n\n		args.push_back (\"--\");\n		args.push_back (devicePath);\n		args.push_back (mountPoint);\n\n		Process::Execute (\"mount\", args);\n	}\n\n	VolumeSlotNumber CoreUnix::MountPointToSlotNumber (const DirectoryPath &mountPoint) const\n	{\n		string mountPointStr (mountPoint);\n		if (mountPointStr.find (GetDefaultMountPointPrefix()) == 0)\n		{\n			try\n			{\n				return StringConverter::ToUInt32 (StringConverter::GetTrailingNumber (mountPointStr));\n			}\n			catch (...) { }\n		}\n		return GetFirstFreeSlotNumber();\n	}\n\n	shared_ptr <VolumeInfo> CoreUnix::MountVolume (MountOptions &options)\n	{\n		\n		CoalesceSlotNumberAndMountPoint (options);\n\n		if (IsVolumeMounted (*options.Path))\n			throw VolumeAlreadyMounted (SRC_POS);\n\n		Cipher::EnableHwSupport (!options.NoHardwareCrypto);\n\n		shared_ptr <Volume> volume;\n\n		while (true)\n		{\n			try\n			{\n				volume = OpenVolume (\n					options.Path,\n					options.PreserveTimestamps,\n					options.Password,\n					options.Keyfiles,\n					options.Protection,\n					options.ProtectionPassword,\n					options.ProtectionKeyfiles,\n					options.SharedAccessAllowed,\n					VolumeType::Unknown,\n					options.UseBackupHeaders,\n					options.PartitionInSystemEncryptionScope\n					);\n\n				options.Password.reset();\n			}\n			catch (SystemException &e)\n			{\n				if (options.Protection != VolumeProtection::ReadOnly\n					&& (e.GetErrorCode() == EROFS || e.GetErrorCode() == EACCES || e.GetErrorCode() == EPERM))\n				{\n					// Read-only filesystem\n					options.Protection = VolumeProtection::ReadOnly;\n					continue;\n				}\n\n				throw;\n			}\n\n			break;\n		}\n        \n		if (options.Path->IsDevice())\n		{\n			if (volume->GetFile()->GetDeviceSectorSize() != volume->GetSectorSize())\n				throw ParameterIncorrect (SRC_POS);\n\n#if defined (TC_LINUX)\n			if (volume->GetSectorSize() != TC_SECTOR_SIZE_LEGACY)\n			{\n				if (options.Protection == VolumeProtection::HiddenVolumeReadOnly)\n					throw UnsupportedSectorSizeHiddenVolumeProtection();\n\n				if (options.NoKernelCrypto)\n					throw UnsupportedSectorSizeNoKernelCrypto();\n			}\n#endif\n		}\n\n		// Find a free mount point for FUSE service\n		MountedFilesystemList mountedFilesystems = GetMountedFilesystems ();\n		string fuseMountPoint;\n		for (int i = 1; true; i++)\n		{\n			stringstream path;\n			path << GetTempDirectory() << \"/\" << GetFuseMountDirPrefix() << i;\n			FilesystemPath fsPath (path.str());\n\n			bool inUse = false;\n\n			foreach_ref (const MountedFilesystem &mf, mountedFilesystems)\n			{\n				if (mf.MountPoint == path.str())\n				{\n					inUse = true;\n					break;\n				}\n			}\n\n			if (!inUse)\n			{\n				try\n				{\n					if (fsPath.IsDirectory())\n						fsPath.Delete();\n\n					throw_sys_sub_if (mkdir (path.str().c_str(), S_IRUSR | S_IXUSR) == -1, path.str());\n\n					fuseMountPoint = fsPath;\n					break;\n				}\n				catch (...)\n				{\n					if (i > 255)\n						throw TemporaryDirectoryFailure (SRC_POS, StringConverter::ToWide (path.str()));\n				}\n			}\n		}\n\n		try\n		{\n			FuseService::Mount (volume, options.SlotNumber, fuseMountPoint);\n		}\n		catch (...)\n		{\n			try\n			{\n				DirectoryPath (fuseMountPoint).Delete();\n			}\n			catch (...) { }\n		\n			throw;\n		}\n		\n\n		try\n		{\n			// Create a mount directory if a default path has been specified\n			bool mountDirCreated = false;\n			string mountPoint;\n			if (!options.NoFilesystem && options.MountPoint)\n			{\n				mountPoint = *options.MountPoint;\n#ifndef TC_MACOSX\n				if (mountPoint.find (GetDefaultMountPointPrefix()) == 0 && !options.MountPoint->IsDirectory())\n				{\n					Directory::Create (*options.MountPoint);\n					try\n					{\n						throw_sys_sub_if (chown (mountPoint.c_str(), GetRealUserId(), GetRealGroupId()) == -1, mountPoint);\n					} catch (ParameterIncorrect&) { }\n\n					mountDirCreated = true;\n				}\n#endif\n			}\n           \n			try\n			{\n				try\n				{\n					SystemLog::WriteError(\"CoreUnix::MountVolume: trying MountVolumeNative\");\n					MountVolumeNative (volume, options, fuseMountPoint);\n				}\n				catch (NotApplicable&)\n				{\n					SystemLog::WriteError(\"CoreUnix::MountVolume: exception NotApplicable; trying MountAusVolumeImage\");\n					MountAuxVolumeImage (fuseMountPoint, options);\n				}\n			}\n			catch (...)\n			{\n				if (mountDirCreated)\n					SystemLog::WriteError(\"CoreUnix::MountVolume: exception; mountDirCreated\");\n					remove (mountPoint.c_str());\n				throw;\n			}\n		}\n		catch (...)\n		{\n			try\n			{\n				VolumeInfoList mountedVolumes = GetMountedVolumes (*options.Path);\n				if (mountedVolumes.size() > 0)\n				{\n					shared_ptr <VolumeInfo> mountedVolume (mountedVolumes.front());\n					DismountVolume (mountedVolume);\n				}\n			}\n			catch (...) { }\n			throw;\n		}\n\n		SystemLog::WriteError(\"CoreUnix::MountVolume: MOUNTED\");\n		VolumeInfoList mountedVolumes = GetMountedVolumes (*options.Path);\n		if (mountedVolumes.size() != 1)\n			SystemLog::WriteError(\"mountedVolumes size\");\n			throw ParmeterIncorrect (SRC_POS);\n\n		VolumeEventArgs eventArgs (mountedVolumes.front());\n		VolumeMountedEvent.Raise (eventArgs);\n\n		return mountedVolumes.front();\n	}\n\n	void CoreUnix::MountAuxVolumeImage (const DirectoryPath &auxMountPoint, const MountOptions &options) const\n	{\n		DevicePath loopDev = AttachFileToLoopDevice (string (auxMountPoint) + FuseService::GetVolumeImagePath(), options.Protection == VolumeProtection::ReadOnly);\n\n		try\n		{\n			FuseService::SendAuxDeviceInfo (auxMountPoint, loopDev, loopDev);\n		}\n		catch (...)\n		{\n			try\n			{\n				DetachLoopDevice (loopDev);\n			}\n			catch (...) { }\n			throw;\n		}\n\n		if (!options.NoFilesystem && options.MountPoint && !options.MountPoint->IsEmpty())\n		{\n			MountFilesystem (loopDev, *options.MountPoint,\n				StringConverter::ToSingle (options.FilesystemType),\n				options.Protection == VolumeProtection::ReadOnly,\n				StringConverter::ToSingle (options.FilesystemOptions));\n		}\n	}\n\n	void CoreUnix::SetFileOwner (const FilesystemPath &path, const UserId &owner) const\n	{\n		throw_sys_if (chown (string (path).c_str(), owner.SystemId, (gid_t) -1) == -1);\n	}\n\n	DirectoryPath CoreUnix::SlotNumberToMountPoint (VolumeSlotNumber slotNumber) const\n	{\n		if (slotNumber < GetFirstSlotNumber() || slotNumber > GetLastSlotNumber())\n			throw ParameterIncorrect (SRC_POS);\n\n		stringstream s;\n		s << GetDefaultMountPointPrefix() << slotNumber;\n		return s.str();\n	}\n}\n",
+			"file": "Core/Unix/CoreUnix.cpp",
+			"file_size": 14333,
+			"file_write_time": 130422920630000000,
+			"settings":
+			{
+				"buffer_size": 14332,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Platform/FileStego.h",
+			"settings":
+			{
+				"buffer_size": 2513,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Platform/Unix/File.cpp",
+			"settings":
+			{
+				"buffer_size": 8515,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Platform/Unix/File.d",
+			"settings":
+			{
+				"buffer_size": 1489,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Core/Unix/Linux/CoreLinux.cpp",
+			"settings":
+			{
+				"buffer_size": 13208,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Core/VolumeCreator.cpp",
+			"settings":
+			{
+				"buffer_size": 11720,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Volume/Volume.cpp",
+			"settings":
+			{
+				"buffer_size": 13178,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Main/Forms/VolumeCreationWizard.cpp",
+			"settings":
+			{
+				"buffer_size": 43346,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Main/Forms/EncoderOptionsWizardPage.h",
+			"settings":
+			{
+				"buffer_size": 2115,
+				"line_ending": "Unix"
+			}
+		},
+		{
+			"file": "Volume/EncoderAlgorithm.cpp",
+			"settings":
+			{
+				"buffer_size": 795,
+				"line_ending": "Unix"
+			}
+		}
+	],
+	"build_system": "",
+	"command_palette":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"console":
+	{
+		"height": 0.0,
+		"history":
+		[
+		]
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"file_history":
+	[
+		"/home/momo/Documents/stegotruecrypt.v2/Core/Unix/CoreUnix.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Core/CoreBase.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Common/Language.xml",
+		"/home/momo/Documents/stegotruecrypt.v2/Main/Forms/EncoderOptionsWizardPage.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Core/CoreBase.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Common/Dlgcode.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Common/Dlgcode.c",
+		"/home/momo/Documents/stegotruecrypt.v2/Boot/Windows/BootMain.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Boot/Windows/BootMain.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Main/Forms/VolumeSizeWizardPage.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Platform/FilesystemPath.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Core/Unix/CoreUnix.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Lib/StegoLib/Inc/Fuse/FuseService.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Lib/StegoLib/Inc/FuseService.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Driver/Fuse/FuseService.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Main/Forms/Forms.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Main/Forms/Forms.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Main/FavoriteVolume.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Main/Forms/VolumeSizeWizardPage.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Driver/Fuse/FuseService.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Platform/FileStego.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Core/VolumeCreator.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Core/VolumeCreator.cpp",
+		"/home/momo/Desktop/Bakalarocka 2/literatura.bib",
+		"/home/momo/Documents/stegotruecrypt.v2/Volume/EncoderAlgorithm.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Volume/EncoderAlgorithm.cpp",
+		"/home/momo/Documents/stegotruecrypt.v2/Main/GraphicUserInterface.cpp",
+		"/home/momo/Desktop/2014.04.11.FEIstyle/includes/bibliography.bib",
+		"/home/momo/Downloads/2014.04.11.FEIstyle/includes/conclusion.tex",
+		"/home/momo/Documents/stegotruecrypt.v2/Volume/Volume.h",
+		"/home/momo/Documents/stegotruecrypt.v2/Volume/Keyfile.h",
+		"/home/momo/Documents/truecrypt-7.1a-source/Main/GraphicUserInterface.cpp",
+		"/home/momo/Documents/truecrypt-7.1a-source/Main/GraphicUserInterface.h",
+		"/home/momo/Documents/truecrypt-7.1a-source/Main/Application.h",
+		"/home/momo/Documents/truecrypt-7.1a-source/Main/GraphicUserInterface.d"
+	],
+	"find":
+	{
+		"height": 35.0
+	},
+	"find_in_files":
+	{
+		"height": 93.0,
+		"where_history":
+		[
+			"/home/momo/Documents/stegotruecrypt.v2/",
+			"/home/momo/Documents/stegotruecrypt.v2/Main"
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": false,
+		"find_history":
+		[
+			"MountVolume",
+			"Mount",
+			"FileStego",
+			"Close was called",
+			"SetMaxVolumeSize",
+			"MaxVolumeSize",
+			"MinVolumeSize",
+			"dynamic_cast",
+			"manager",
+			"Encoder",
+			"manager",
+			"IsValid",
+			"isValid",
+			"Val",
+			"Valid",
+			"LSB",
+			"Dir",
+			"File"
+		],
+		"highlight": true,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": false,
+		"replace_history":
+		[
+		],
+		"reverse": false,
+		"show_context": true,
+		"use_buffer2": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"groups":
+	[
+		{
+			"selected": 1,
+			"sheets":
+			[
+				{
+					"buffer": 0,
+					"file": "Platform/FileStego.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 5157,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								0,
+								0
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 945.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 4,
+					"type": "text"
+				},
+				{
+					"buffer": 1,
+					"file": "Core/Unix/CoreUnix.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 14332,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								12932,
+								12932
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 7683.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 0,
+					"type": "text"
+				},
+				{
+					"buffer": 2,
+					"file": "Platform/FileStego.h",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 2513,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								2061,
+								2061
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 2,
+					"type": "text"
+				},
+				{
+					"buffer": 3,
+					"file": "Platform/Unix/File.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 8515,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								0,
+								0
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 540.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 1,
+					"type": "text"
+				},
+				{
+					"buffer": 4,
+					"file": "Platform/Unix/File.d",
+					"semi_transient": true,
+					"settings":
+					{
+						"buffer_size": 1489,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								0,
+								0
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/D/D.tmLanguage"
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 3,
+					"type": "text"
+				},
+				{
+					"buffer": 5,
+					"file": "Core/Unix/Linux/CoreLinux.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 13208,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								1055,
+								1055
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 315.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 6,
+					"type": "text"
+				},
+				{
+					"buffer": 6,
+					"file": "Core/VolumeCreator.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 11720,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								6401,
+								6401
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 2820.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 7,
+					"type": "text"
+				},
+				{
+					"buffer": 7,
+					"file": "Volume/Volume.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 13178,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								0,
+								0
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 990.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 5,
+					"type": "text"
+				},
+				{
+					"buffer": 8,
+					"file": "Main/Forms/VolumeCreationWizard.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 43346,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								6623,
+								6623
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"tab_size": 4,
+							"translate_tabs_to_spaces": true
+						},
+						"translation.x": 0.0,
+						"translation.y": 1796.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 9,
+					"type": "text"
+				},
+				{
+					"buffer": 9,
+					"file": "Main/Forms/EncoderOptionsWizardPage.h",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 2115,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								2048,
+								2048
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 8,
+					"type": "text"
+				},
+				{
+					"buffer": 10,
+					"file": "Volume/EncoderAlgorithm.cpp",
+					"semi_transient": false,
+					"settings":
+					{
+						"buffer_size": 795,
+						"regions":
+						{
+						},
+						"selection":
+						[
+							[
+								555,
+								555
+							]
+						],
+						"settings":
+						{
+							"syntax": "Packages/C++/C++.tmLanguage",
+							"translate_tabs_to_spaces": false
+						},
+						"translation.x": 0.0,
+						"translation.y": 0.0,
+						"zoom_level": 1.0
+					},
+					"stack_index": 10,
+					"type": "text"
+				}
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 25.0
+	},
+	"input":
+	{
+		"height": 0.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": true,
+	"output.find_results":
+	{
+		"height": 0.0
+	},
+	"project": "TC.sublime-project",
+	"replace":
+	{
+		"height": 46.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_symbol":
+	{
+		"height": 0.0,
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"settings":
+	{
+	},
+	"show_minimap": true,
+	"show_open_files": false,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 308.0,
+	"status_bar_visible": true,
+	"template_settings":
+	{
+	}
+}

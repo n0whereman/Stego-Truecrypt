@@ -1,0 +1,30 @@
+Unix/Process.o: Unix/Process.cpp Unix/Process.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/PlatformBase.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/SystemLog.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/StringConverter.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/PlatformBase.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Buffer.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Memory.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Functor.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Exception.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Serializable.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/ForEach.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Serializer.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Buffer.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/SharedPtr.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/SharedVal.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Mutex.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Stream.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/SerializerFactory.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/StringConverter.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/FileStream.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/File.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/FilesystemPath.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/User.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/SystemException.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Exception.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/ForEach.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/MemoryStream.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/SystemException.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Unix/Pipe.h \
+ /home/momo/Documents/stegotruecrypt.v2/Platform/Unix/Poller.h

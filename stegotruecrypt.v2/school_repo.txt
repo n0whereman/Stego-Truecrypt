@@ -1,0 +1,2 @@
+git clone xorem@147.175.106.232:/home/git/stegotruecrypt
+dolezita zmena
